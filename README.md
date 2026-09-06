@@ -1,4 +1,4 @@
-# RTD-P9 (reference clone) — Authorize Once, Then Stop Asking
+# Authorize Once, Then Stop Asking
 
 *"Authorize Once, Then Stop Asking" — Road to Devcon III, Build Battle Week 3, PS 3.*
 
