@@ -14,6 +14,45 @@ challenge.
 > All work is confined to this `RTD-P9/` directory. No code in other `RTD-*`
 > directories or the repo root was modified.
 
+## Table of Contents
+
+- [Challenge](#challenge)
+- [Features](#features)
+- [Architecture](#architecture)
+- [End-to-End Flow](#end-to-end-flow)
+- [Technical Architecture](#technical-architecture)
+- [Repository Structure](#repository-structure)
+- [Scoring Criteria & Evidence](#scoring-criteria--evidence)
+- [Security Model](#security-model)
+- [Data Flow](#data-flow)
+- [Setup](#setup)
+- [Environment Variables](#environment-variables)
+- [Verification](#verification)
+- [Manual QA](#manual-qa)
+- [Local vs Live](#local-vs-live)
+- [Limitations](#limitations)
+- [Challenge Completion](#challenge-completion)
+
+## Challenge
+
+**"Authorize Once, Then Stop Asking"** — Road To Devcon - III problem P9. A
+member approves a **delegated-actions wallet grant** a single time, and a
+durable, idempotent scheduler then makes the recurring weekly contribution
+unattended. The grant scope is pinned to the **committed contribution
+contract**, capped in value, and bounded in time — so the member is never
+prompted again and never over-authorized.
+
+## Features
+
+- **One-time delegated wallet grant** — `useDelegatedActions().delegateWallet` in the join flow.
+- **Committed contribution policy** — allowlists the contract, caps value, `DENY *` catch-all.
+- **Time-bounded authorization** — durable expiry (90 days by default).
+- **Server-side authorization key** — environment-loaded, signs the delegated transaction.
+- **Weekly unattended scheduler** — real committed crontab path, mark-expired then claim-then-send.
+- **Durable idempotency** — `UNIQUE(member_id, period)`, safe across restarts.
+- **Member revoke** — one tap; later rounds record `skipped` and never send.
+- **Per-member outcome ledger** — `contributed` / `skipped (reason)` / `failed (reason)`.
+
 ## Architecture
 
 ```mermaid
@@ -63,47 +102,35 @@ flowchart LR
     SL --> SC
 ```
 
-## End-to-end flow
+## End-to-End Flow
 
 ```mermaid
 sequenceDiagram
-    participant M as Member browser
-    participant N as Next.js server
-    participant P as Privy Wallet API
-    participant S as SQLite circle.db
+    participant Member
+    participant App
+    participant Privy
+    participant DB
+    participant Scheduler
 
-    M->>M: login via Privy (embedded wallet minted)
-    M->>P: delegateWallet({address, chainType:"ethereum"}) - ONCE
-    P-->>M: grant approved
-    M->>N: POST /api/join (Bearer + walletAddress)
-    N->>S: ensureMember + setAuthorization (TTL 90d)
-    N-->>M: authorization active, expiresAt
-    N->>S: /api/me returns joined state + policy + ledger
+    Member->>Privy: Approve delegated wallet grant
+    Member->>App: Join
+    App->>DB: Store authorization and expiry
+    App-->>Member: Authorization active
 
-    activate N
-    Note over N,S: crontab weekly Mon 12:00 UTC → scripts/run-scheduler.ts
-    N->>S: markExpired(now)
-    N->>S: list memberships
-    loop each membership
-        N->>S: claimContribution(member, period) - idempotent
-        alt active authorization
-            N->>P: ethereum.sendTransaction (signed by env authorization key)
-            P-->>N: tx hash (or policy rejection)
-            N->>S: markContributed / markFailed(reason)
-        else revoked / expired
-            N->>S: markSkipped(reason)
-        end
-    end
-    deactivate N
+    Scheduler->>DB: Claim contribution for period
+    DB-->>Scheduler: Claim accepted
+    Scheduler->>Privy: Submit authorized transaction
+    Privy-->>Scheduler: Transaction result
+    Scheduler->>DB: Record outcome
 
-    M->>N: POST /api/revoke (+ SDK revokeWallets)
-    N->>S: revokeAuthorization
-    N-->>M: status=revoked; next round records skipped
+    Member->>App: Revoke
+    App->>Privy: Revoke delegated wallet
+    App->>DB: Mark authorization revoked
 ```
 
-## Technical architecture
+## Technical Architecture
 
-| Layer | Choice | Notes |
+| Layer | Technology | Responsibility |
 | --- | --- | --- |
 | Frontend | React 19 + Next.js 15 (App Router, `use client`) | `InitializingScreen`, `LoginScreen`, `CircleShell`, `CircleDashboard` |
 | Auth + wallets | `@privy-io/react-auth` | login modal, embedded wallets (`createOnLogin`), `useDelegatedActions()` |
@@ -116,24 +143,30 @@ sequenceDiagram
 | Contract target | `contracts/ContributionCircle.sol` (reference) | committed allowlisted `contribute()` target; never deployed by this repo |
 | Error handling | `lib/errors.ts` + `lib/http.ts` + `lib/contributor.ts` | `classifyContributionError` → durable `rejected_by_policy` / original message |
 
-## Repository structure
+## Repository Structure
 
 ```
-app/api/{join,me,revoke}/route.ts   join -> durable grant; me -> state+policy+ledger; revoke
-components/                         LoginScreen, InitializingScreen, CircleShell, CircleDashboard
-contracts/ContributionCircle.sol    committed allowlisted contract (reference)
-policies/contribution-policy.ts     single source of truth for the grant scope
-lib/                                config, periods, store, store-loader, auth, http, errors,
-                                    policy, contributor, scheduler
-scheduling/contribution-scheduler.crontab   the real recurring weekly execution path
-scripts/                            run-scheduler, check-server-auth
-tests/                              unit + component + security audits (8 files, 44 tests)
-data/                               SQLite (gitignored)
+app/
+├─ api/join/route.ts        durable membership + authorization grant
+├─ api/me/route.ts          member state + policy + outcome ledger
+└─ api/revoke/route.ts      revoke authorization
+components/                 LoginScreen, InitializingScreen, CircleShell, CircleDashboard
+contracts/
+└─ ContributionCircle.sol   committed allowlisted contract (reference)
+policies/
+└─ contribution-policy.ts   single source of truth for the grant scope
+lib/                        config, periods, store, store-loader, auth, http, errors,
+                            policy, contributor, scheduler
+scheduling/
+└─ contribution-scheduler.crontab   the real recurring weekly execution path
+scripts/                    run-scheduler, check-server-auth
+tests/                      unit + component + security audits (8 files, 44 tests)
+data/                       SQLite (gitignored)
 ```
 
-## Scoring criteria → evidence
+## Scoring Criteria & Evidence
 
-| # | Challenge criterion | Implementation | Automated evidence |
+| Criterion | Requirement | Implementation | Evidence |
 | --- | --- | --- | --- |
 | P9-1 | one-time **SDK grant call** from the joining flow | `useDelegatedActions().delegateWallet({ address, chainType:"ethereum" })` on *Authorize once & join* in `components/CircleDashboard.tsx`; server persists a durable active authorization with a TTL via `POST /api/join` (`app/api/join/route.ts`) | `tests/components.test.tsx` "delegates the embedded wallet and joins" asserts `delegateWallet` is called; `tests/api.test.ts` asserts the durable authorization row |
 | P9-2 | committed **policy allowlists the contribution contract** | `buildContributionPolicy` rule `ALLOW eth_sendTransaction` with `to in [CONTRIBUTION_CONTRACT_ADDRESS]` + catch-all `DENY *` (`policies/contribution-policy.ts`); target = committed `contracts/ContributionCircle.sol`; placeholder address is *refused* | `tests/policy-builder.test.ts` "allows eth_sendTransaction only to the contract" + "refuses to pin the zero placeholder" |
@@ -145,32 +178,19 @@ data/                               SQLite (gitignored)
 | P9-8 | **per-member failure outcomes, batch continues** | per-member try/catch; policy rejections classified -> durable `failed (rejected_by_policy)`; revoked/expired -> durable `skipped (reason)`; one failure never aborts the round | `tests/scheduler.test.ts` "policy DENY... rejected_by_policy", "failing member does not stop other members", "skips revoked and expired", "P9-8 rejection classification"; `tests/store.test.ts` reopen durability |
 | P9-9 | **no secrets in tracked files** | `.env*` gitignored; `.env.example` is placeholder-only; scan covers 64/128-hex and `sk-...` tokens across tracked sources incl. `.crontab` | `tests/secret-scan.test.ts` |
 
-## Security model
+## Security Model
 
-- **The policy is the enforce point.** Even if application code drifted, Privy
-  itself rejects any `eth_sendTransaction` whose destination is not the
-  committed contract or whose value exceeds the cap. The `DENY *` catch-all
-  covers every other method, every other destination, every other value.
-- **The policy refuses placeholders.** `assertContributionPolicyInput`
-  (`policies/contribution-policy.ts`) refuses the zero address, so nothing
-  half-configured can be pushed to the Wallet API.
-- **Key handling.** `PRIVY_AUTHORIZATION_PRIVATE_KEY` is read from the process
-  environment on the server only (`lib/config.ts`), injected once into the
-  `PrivyClient` (`lib/auth.ts`), and never sent to the browser.
-- **Cap and expiry bound the worst case.** 0.01 ETH/week and a 90-day grant
-  cap the member's exposure to at most 0.01 ETH × ~13 weekly rounds ≈ 0.13 ETH,
-  and only to the committed contract.
-- **Fail-safe scheduler.** Idempotency is at the storage layer
-  (`UNIQUE(member_id, period)`), claimed *before* any send; a crash between
-  claim and submit leaves a `claimed` row that the next run finalizes as a
-  durable skip. Double-cron fire can never double-send.
-- **Per-member isolation.** Expired/revoked members are skipped with a durable
-  reason; a policy rejection is recorded as `failed (rejected_by_policy)` and
-  the round continues.
-- **Authenticated API only.** `join`, `me` and `revoke` all require server-side
-  `verifyAuthToken`; state is keyed on `claims.userId`.
+| Control | Enforcement | Purpose |
+| --- | --- | --- |
+| Policy is the enforce point | Privy rejects any `eth_sendTransaction` outside the allowlist/cap; `DENY *` catch-all covers every other method, destination, value | even application drift cannot move other funds |
+| Placeholder refusal | `assertContributionPolicyInput` refuses the zero address | a half-configured policy is never pushed to the Wallet API |
+| Key handling | `PRIVY_AUTHORIZATION_PRIVATE_KEY` read server-side from env only, injected once | the signing key never reaches the browser |
+| Cap + expiry bound the worst case | 0.01 ETH/week, 90-day grant → ≤ 0.01 ETH × ~13 weeks ≈ 0.13 ETH to one contract | bounded exposure per member |
+| Fail-safe scheduler | idempotency at the storage layer (`UNIQUE(member_id, period)`), claim **before** send | a crash or double-cron can never double-send |
+| Per-member isolation | per-member try/catch; revoked/expired → durable `skipped (reason)`; policy rejection → durable `failed (rejected_by_policy)` | one member never aborts the round |
+| Authenticated API only | `join`, `me`, `revoke` all require server-side `verifyAuthToken`; state keyed on `claims.userId` | only the member manages their own authorization |
 
-## Data flow
+## Data Flow
 
 1. **Join.** After Privy login the embedded wallet exists. The member taps
    *Authorize once & join* → `delegateWallet` (the single prompt) → the client
@@ -210,22 +230,24 @@ npm run check:auth -- <access-token>      # real token signature check via Privy
 npm run check:auth -- <access-token> --create-policy  # also push the policy to the Wallet API
 ```
 
-## Environment variables
+> Note: P9's local `.env.example` is intentionally not tracked — its own
+> `.gitignore` applies the stricter `.env.*` rule. The variable table below is
+> the working template.
 
-`.env` (never committed — only `.env.example` is tracked):
+## Environment Variables
 
-| Variable | Required | Meaning |
+| Variable | Purpose | Required |
 | --- | --- | --- |
-| `PRIVY_APP_ID` | yes | Server-side Privy app id |
-| `PRIVY_APP_SECRET` | yes | Server-side secret (never in client code) |
-| `NEXT_PUBLIC_PRIVY_APP_ID` | yes | Client-side app id for the login provider |
-| `PRIVY_AUTHORIZATION_PRIVATE_KEY` | yes | **(P9-5)** backend Wallet API authorization key, loaded from env at runtime |
-| `CONTRIBUTION_CONTRACT_ADDRESS` | for a live round | **Deployed** `ContributionCircle` address on Base Sepolia; policy builder **refuses** the placeholder |
-| `WEEKLY_CONTRIBUTION_CAP_WEI` | no | Per-contribution cap, default `10000000000000000` (0.01 ETH) — enforced **in the policy** |
-| `AUTHORIZATION_TTL_SECONDS` | no | Grant lifetime, default `7776000` (90 d) |
-| `CAIP2_CHAIN` | no | `eip155:84532` (Base Sepolia), the challenge network |
-| `NEXT_PUBLIC_CIRCLE_NAME` | no | Display name |
-| `DB_PATH` | no | SQLite path, default `data/circle.db` |
+| `PRIVY_APP_ID` | Server-side Privy app id | yes |
+| `PRIVY_APP_SECRET` | Server-side secret (never in client code) | yes |
+| `NEXT_PUBLIC_PRIVY_APP_ID` | Client-side app id for the login provider | yes |
+| `PRIVY_AUTHORIZATION_PRIVATE_KEY` | **(P9-5)** backend Wallet API authorization key, loaded from env at runtime | yes |
+| `CONTRIBUTION_CONTRACT_ADDRESS` | **Deployed** `ContributionCircle` address on Base Sepolia (policy builder **refuses** the placeholder) | for a live round |
+| `WEEKLY_CONTRIBUTION_CAP_WEI` | Per-contribution cap, default `10000000000000000` (0.01 ETH) — enforced **in the policy** | no |
+| `AUTHORIZATION_TTL_SECONDS` | Grant lifetime, default `7776000` (90 d) | no |
+| `CAIP2_CHAIN` | `eip155:84532` (Base Sepolia), the challenge network | no |
+| `NEXT_PUBLIC_CIRCLE_NAME` | Display name | no |
+| `DB_PATH` | SQLite path, default `data/circle.db` | no |
 
 ## Verification
 
@@ -280,7 +302,7 @@ live check.
 | 7 | (Optional) sign in with a second account | The same weekly round serves both members independently; cause one member's submission to fail -> the other still settles (P9-8) |
 | 8 | Inspect the ledger | Every attempt has a durable outcome: `contributed` + hash, `skipped` + reason, `failed` + reason |
 
-## Local vs. live
+## Local vs Live
 
 | Surface | Local (this repo) | Live |
 | --- | --- | --- |
@@ -310,7 +332,7 @@ live check.
   placeholder-only, and `scripts/check-server-auth.ts` will exit 1 without the
   key.
 
-## Final challenge completion
+## Challenge Completion
 
 This repository satisfies **all 9 scored criteria (P9-1 … P9-9)** on the Road
 To Devcon - III problem *"Authorize Once, Then Stop Asking"*:
