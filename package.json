@@ -1,0 +1,43 @@
+{
+  "name": "rtd-p9-savings-circle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Road To Devcon III - P9. Authorize Once, Then Stop Asking. A savings circle where a member authorizes once via a scoped, capped, expiring Privy grant; a durable, idempotent scheduled backend makes the weekly contribution while the member is offline.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "run-scheduler": "tsx scripts/run-scheduler.ts",
+    "check:auth": "tsx scripts/check-server-auth.ts"
+  },
+  "dependencies": {
+    "@privy-io/react-auth": "^3.40.0",
+    "@privy-io/server-auth": "^1.32.5",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^17.4.2",
+    "next": "^15.5.25",
+    "permissionless": "^0.2.57",
+    "react": "^19.1.9",
+    "react-dom": "^19.1.9",
+    "viem": "^2.28.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.0",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "jsdom": "^26.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=20.12"
+  }
+}

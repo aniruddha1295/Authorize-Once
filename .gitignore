@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# next.js build output
+.next/
+out/
+*.tsbuildinfo
+
+# secrets — never commit
+.env
+.env.*
+
+# database
+data/*
+!data/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+
+# tooling
+coverage/
+*.log
+.DS_Store
+Thumbs.db

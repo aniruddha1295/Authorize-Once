@@ -1,0 +1,38 @@
+# -----------------------------------------------------------------------------
+# RTD-P9 — "Authorize Once, Then Stop Asking"
+#
+# The REAL recurring execution path for the contribution job.
+#
+# Every Monday at 12:00 UTC this runs one contribution round for the current
+# weekly period. `scripts/run-scheduler.ts` walks every membership, and the
+# durable store (data/circle.db) guarantees that a member+period pair has at
+# most ONE outcome — re-runs and restart-crashes can never create a second
+# contribution (P9-6).
+#
+# Install:
+#   crontab scheduling/contribution-scheduler.crontab        (Linux/macOS)
+#   /usr/bin/crontab scheduling/contribution-scheduler.crontab
+#
+# Health-check the schedule with:
+#   crontab -l
+#   tail -f data/scheduler.log           # every run appends its summary line
+#
+# Alternative for systemd hosts — a weekly timer unit:
+#   [Unit]
+#   Description=RTD-P9 weekly contribution round
+#   [Service]
+#   WorkingDirectory=/path/to/RTD-P9
+#   EnvironmentFile=/path/to/RTD-P9/.env
+#   ExecStart=/path/to/RTD-P9/node_modules/.bin/tsx scripts/run-scheduler.ts
+#   [Timer]
+#   OnCalendar=Mon *-*-* 12:00:00 UTC
+#   Persistent=true
+#   [Install]
+#   WantedBy=timers.target
+#
+# Dry/manual trigger (equivalent, deterministic):
+#   npm run run-scheduler
+# -----------------------------------------------------------------------------
+
+# min hour dom month dow   command
+0     12   *   *     1     cd /path/to/RTD-P9 && npx tsx scripts/run-scheduler.ts >> data/scheduler.log 2>&1
