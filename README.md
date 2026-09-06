@@ -1,353 +1,153 @@
-# RTD-P9 — Authorize Once, Then Stop Asking
+# RTD-P9 (reference clone) — Authorize Once, Then Stop Asking
 
-A savings circle where a member authorizes **once** with a scoped, capped,
-expiring Privy delegated-actions grant. After that single approval, a durable,
-idempotent scheduled backend makes the weekly contribution while the member is
-offline — always to the **committed** contribution contract, always under a
-**policy-enforced** value cap, for at most 90 days. The member can revoke at
-any time from the product UI, and every attempted outcome is recorded in a
-durable ledger.
+*"Authorize Once, Then Stop Asking" — Road to Devcon III, Build Battle Week 3, PS 3.*
 
-Network: **Base Sepolia** (`eip155:84532`) — the network specified by the
-challenge.
+A savings-circle backend built around Privy's **delegated-actions** grant: a member approves
+once in the join flow, and a scheduled job then makes their weekly contribution while they're
+offline, supposedly under a policy-enforced contract allowlist, value cap, and expiry. Cloned
+from `github.com/Niru-9/road-to-DEVCON-P9` for comparison against our own PS 3 repo, then
+verified line-by-line and by actually running its test/build pipeline rather than trusting its
+README's self-graded table.
 
-> All work is confined to this `RTD-P9/` directory. No code in other `RTD-*`
-> directories or the repo root was modified.
+> This is a third-party submission, not ours. Kept at `week 3/reference-road-to-DEVCON-P9/` for
+> reference only — it retains its own git history and is not one of our three Week 3 repos.
 
-## Table of Contents
-
-- [Challenge](#challenge)
-- [Features](#features)
-- [Architecture](#architecture)
-- [End-to-End Flow](#end-to-end-flow)
-- [Technical Architecture](#technical-architecture)
-- [Repository Structure](#repository-structure)
-- [Scoring Criteria & Evidence](#scoring-criteria--evidence)
-- [Security Model](#security-model)
-- [Data Flow](#data-flow)
-- [Setup](#setup)
-- [Environment Variables](#environment-variables)
-- [Verification](#verification)
-- [Manual QA](#manual-qa)
-- [Local vs Live](#local-vs-live)
-- [Limitations](#limitations)
-- [Challenge Completion](#challenge-completion)
-
-## Challenge
-
-**"Authorize Once, Then Stop Asking"** — Road To Devcon - III problem P9. A
-member approves a **delegated-actions wallet grant** a single time, and a
-durable, idempotent scheduler then makes the recurring weekly contribution
-unattended. The grant scope is pinned to the **committed contribution
-contract**, capped in value, and bounded in time — so the member is never
-prompted again and never over-authorized.
-
-## Features
-
-- **One-time delegated wallet grant** — `useDelegatedActions().delegateWallet` in the join flow.
-- **Committed contribution policy** — allowlists the contract, caps value, `DENY *` catch-all.
-- **Time-bounded authorization** — durable expiry (90 days by default).
-- **Server-side authorization key** — environment-loaded, signs the delegated transaction.
-- **Weekly unattended scheduler** — real committed crontab path, mark-expired then claim-then-send.
-- **Durable idempotency** — `UNIQUE(member_id, period)`, safe across restarts.
-- **Member revoke** — one tap; later rounds record `skipped` and never send.
-- **Per-member outcome ledger** — `contributed` / `skipped (reason)` / `failed (reason)`.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph Browser
-        Shell[CircleShell - ready &amp; authenticated gates]
-        Dash[CircleDashboard - join / status / revoke / ledger]
-        Login[LoginScreen - Privy login modal]
-        Init[InitializingScreen - loading state]
-    end
-
-    subgraph Privy
-        DA[delegated-actions - delegateWallet / revokeWallets]
-        WAPI[Wallet API - createPolicy + RPC calls]
-        PA[policies/contribution-policy.ts - committed grant scope]
-    end
-
-    subgraph AppServer["Next.js server + scheduler"]
-        JC[/api/join - durable membership + grant row/]
-        ME[/api/me - state + policy + ledger/]
-        RE[/api/revoke - flip status/]
-        SC[lib/scheduler.ts - weekly round, claim-then-send]
-        SL[scripts/run-scheduler.ts + crontab weekly]
-        KS[lib/auth.ts - env-loaded authorization key]
-    end
-
-    subgraph Ledger["data/circle.db (SQLite)"]
-        M[members + authorizations]
-        C[contributions with UNIQUE member+period]
-    end
-
-    Shell --> Init
-    Shell -->|ready=false| Init
-    Shell -->|authenticated=false| Login
-    Shell -->|authenticated| Dash
-    DA --> JC
-    RE -->|also| DA
-    Dash --> ME
-    Dash --> JC
-    Dash --> RE
-    JC --> SC_0[store]
-    SC --> KS
-    KS --> WAPI
-    WAPI -. enforces .-> PA
-    SC --> C
-    JC --> M
-    SL --> SC
-```
-
-## End-to-End Flow
-
-```mermaid
-sequenceDiagram
-    participant Member
-    participant App
-    participant Privy
-    participant DB
-    participant Scheduler
-
-    Member->>Privy: Approve delegated wallet grant
-    Member->>App: Join
-    App->>DB: Store authorization and expiry
-    App-->>Member: Authorization active
-
-    Scheduler->>DB: Claim contribution for period
-    DB-->>Scheduler: Claim accepted
-    Scheduler->>Privy: Submit authorized transaction
-    Privy-->>Scheduler: Transaction result
-    Scheduler->>DB: Record outcome
-
-    Member->>App: Revoke
-    App->>Privy: Revoke delegated wallet
-    App->>DB: Mark authorization revoked
-```
-
-## Technical Architecture
-
-| Layer | Technology | Responsibility |
-| --- | --- | --- |
-| Frontend | React 19 + Next.js 15 (App Router, `use client`) | `InitializingScreen`, `LoginScreen`, `CircleShell`, `CircleDashboard` |
-| Auth + wallets | `@privy-io/react-auth` | login modal, embedded wallets (`createOnLogin`), `useDelegatedActions()` |
-| Grant scope | `useDelegatedActions().delegateWallet / revokeWallets` | the one-time, user-approved delegated-actions grant (P9-1, P9-7) |
-| Policy | `policies/contribution-policy.ts` (committed) | `ALLOW eth_sendTransaction` to contract with `value lte cap` + `DENY *` catch-all (P9-2, P9-3) |
-| Server auth | `@privy-io/server-auth` | `verifyAuthToken`; `PrivyClient(..., { walletApi: { authorizationPrivateKey } })` (P9-5) |
-| Chain | viem — **Base Sepolia** (`eip155:84532`) | `defaultChain: baseSepolia` in `app/providers.tsx`; address validation |
-| Scheduler | `lib/scheduler.ts` + `scheduling/*.crontab` + `scripts/run-scheduler.ts` | mark-expired → claim-then-send per member, weekly (P9-6) |
-| Persistence | `better-sqlite3` (`data/circle.db`) | `members`, `authorizations`, `contributions` (UNIQUE member+period) |
-| Contract target | `contracts/ContributionCircle.sol` (reference) | committed allowlisted `contribute()` target; never deployed by this repo |
-| Error handling | `lib/errors.ts` + `lib/http.ts` + `lib/contributor.ts` | `classifyContributionError` → durable `rejected_by_policy` / original message |
-
-## Repository Structure
+## Grant lifecycle (as built)
 
 ```
-app/
-├─ api/join/route.ts        durable membership + authorization grant
-├─ api/me/route.ts          member state + policy + outcome ledger
-└─ api/revoke/route.ts      revoke authorization
-components/                 LoginScreen, InitializingScreen, CircleShell, CircleDashboard
-contracts/
-└─ ContributionCircle.sol   committed allowlisted contract (reference)
-policies/
-└─ contribution-policy.ts   single source of truth for the grant scope
-lib/                        config, periods, store, store-loader, auth, http, errors,
-                            policy, contributor, scheduler
-scheduling/
-└─ contribution-scheduler.crontab   the real recurring weekly execution path
-scripts/                    run-scheduler, check-server-auth
-tests/                      unit + component + security audits (8 files, 44 tests)
-data/                       SQLite (gitignored)
+Member:  delegateWallet(address, chainType)  ──▶  Privy delegated-actions grant
+              │                                    (unscoped: no policyId, no expiry passed)
+              ▼
+     POST /api/join  ──▶  app DB row: authorizations.expires_at = now + 90d
+              │
+     [ weekly, unattended ]
+              ▼
+Scheduler:  markExpired(now)  ──▶  flips app-DB rows past expires_at to 'expired'
+              │
+     for each member:  claimContribution(member, period)   (UNIQUE(member_id, period))
+              │
+      claim wins ──▶  walletApi.ethereum.sendTransaction({ address, to, value })
+              │            (no policyId attached to this call, anywhere)
+              ▼
+      success ──▶ markContributed     failure ──▶ markFailed(reason)     skip ──▶ markSkipped(reason)
+
+Member:  revokeWallets()  +  POST /api/revoke  ──▶  app DB row: status = 'revoked'
+                                                     (Privy-side grant is separately revoked too)
 ```
 
-## Scoring Criteria & Evidence
+The two lines marked above are the defect: `policies/contribution-policy.ts` builds a real
+allowlist-plus-cap rule, and `lib/policy.ts` can push it to Privy via `createPolicy(...)` — but
+nothing in the codebase ever attaches that policy's id to the wallet, the delegation, or the
+`sendTransaction` call. It exists in Privy as a standalone object with nothing bound to it.
 
-| Criterion | Requirement | Implementation | Evidence |
-| --- | --- | --- | --- |
-| P9-1 | one-time **SDK grant call** from the joining flow | `useDelegatedActions().delegateWallet({ address, chainType:"ethereum" })` on *Authorize once & join* in `components/CircleDashboard.tsx`; server persists a durable active authorization with a TTL via `POST /api/join` (`app/api/join/route.ts`) | `tests/components.test.tsx` "delegates the embedded wallet and joins" asserts `delegateWallet` is called; `tests/api.test.ts` asserts the durable authorization row |
-| P9-2 | committed **policy allowlists the contribution contract** | `buildContributionPolicy` rule `ALLOW eth_sendTransaction` with `to in [CONTRIBUTION_CONTRACT_ADDRESS]` + catch-all `DENY *` (`policies/contribution-policy.ts`); target = committed `contracts/ContributionCircle.sol`; placeholder address is *refused* | `tests/policy-builder.test.ts` "allows eth_sendTransaction only to the contract" + "refuses to pin the zero placeholder" |
-| P9-3 | policy **caps value** | same rule carries `value lte WEEKLY_CONTRIBUTION_CAP_WEI` (default 0.01 ETH) — the ceiling lives *in the policy* | `tests/policy-builder.test.ts` "caps the value in the policy itself"; `tests/config.test.ts` (defaults) |
-| P9-4 | grant/policy **expiry** | `authorizations.expires_at` = granted + `AUTHORIZATION_TTL_SECONDS` (default 90 d); scheduler runs `markExpired` each round; state survives restart | `tests/store.test.ts` "authorization expiry and the exact TTL..."; `tests/scheduler.test.ts` "skips revoked and expired members" |
-| P9-5 | server **signs with the env-loaded authorization key** | `PrivyClient(..., { walletApi: { authorizationPrivateKey: cfg.authorizationPrivateKey } })` at `lib/auth.ts:getPrivyClient`; key read from `PRIVY_AUTHORIZATION_PRIVATE_KEY` in `lib/config.ts`; never in client code | `tests/config.test.ts` (env wiring), `tests/secret-scan.test.ts` (never tracked) |
-| P9-6 | **durable idempotency + real scheduled path** | `contributions` `UNIQUE (member_id, period)`; claim-then-send in `runContributionRound`/`processMember` (`lib/scheduler.ts`); committed crontab `scheduling/contribution-scheduler.crontab` runs `scripts/run-scheduler.ts` weekly | `tests/scheduler.test.ts` "re-run never submits again", "resumes safely after a restart mid-run"; `tests/store.test.ts` UNIQUE race; `tests/scheduling.test.ts` (cron) |
-| P9-7 | user-reachable **revoke control** | *Revoke* button -> SDK `revokeWallets()` + `POST /api/revoke` flips status to `revoked` (`components/CircleDashboard.tsx`, `app/api/revoke/route.ts`); next round records `skipped (authorization_revoked)` | `tests/components.test.tsx` "...then revokes"; `tests/api.test.ts` "revokes the authorization... refusing a second revoke"; `tests/scheduler.test.ts` |
-| P9-8 | **per-member failure outcomes, batch continues** | per-member try/catch; policy rejections classified -> durable `failed (rejected_by_policy)`; revoked/expired -> durable `skipped (reason)`; one failure never aborts the round | `tests/scheduler.test.ts` "policy DENY... rejected_by_policy", "failing member does not stop other members", "skips revoked and expired", "P9-8 rejection classification"; `tests/store.test.ts` reopen durability |
-| P9-9 | **no secrets in tracked files** | `.env*` gitignored; `.env.example` is placeholder-only; scan covers 64/128-hex and `sk-...` tokens across tracked sources incl. `.crontab` | `tests/secret-scan.test.ts` |
+## Against the scored checks
 
-## Security Model
+| # | Check | Verified status | Evidence |
+|---|-------|------------------|----------|
+| 1 | Client requests wallet access through the SDK's grant flow | **PASS** | `useDelegatedActions().delegateWallet({ address, chainType: "ethereum" })`, called from *Authorize once & join* in `components/CircleDashboard.tsx`. |
+| 2 | Committed policy allowlists the contribution contract | **FAIL (in substance)** | `buildContributionPolicy` writes a real `to IN [contractAddress]` rule, but `lib/contributor.ts:submitContribution` calls `sendTransaction` with no `policyIds` field, and no wallet-update call anywhere attaches one. Grepped the tree for `policyId`/`policyIds`/`attachPolicy`/`updateWallet`: zero matches. |
+| 3 | Committed policy caps the value a signer may move | **FAIL (in substance)** | Same unattached-policy object carries the `value LTE weeklyCapWei` rule — same defect as check 2. |
+| 4 | The grant carries an expiry | **FAIL** | Upstream's own README admits it: *"the Privy policy object itself carries no expiry field."* `authorizations.expires_at` is an app-DB column the scheduler consults before deciding to call Privy — not a bound on the grant itself. A bug in the scheduler, or a direct Wallet API call with the authorization key, is not stopped by anything on Privy's side. |
+| 5 | Server signs wallet requests with an authorization key | **PASS** | `PrivyClient(appId, appSecret, { walletApi: { authorizationPrivateKey: cfg.authorizationPrivateKey } })` in `lib/auth.ts`, sourced from `process.env` at call time, constructed only server-side. |
+| 6 | Recurring job refuses a second contribution for the same period | **PASS** | `contributions` table: `UNIQUE(member_id, period)`. `lib/scheduler.ts` claims a row before signing; a re-run (even after a mid-run crash leaving a `claimed` row) resolves to a durable skip, never a second send. |
+| 7 | A user-reachable control revokes the grant | **PASS** | A real *Revoke authorization* button in `components/CircleDashboard.tsx` calling `revokeWallets()` + `POST /api/revoke`. |
+| 8 | Revoked/expired signer resolves to a defined server outcome | **PASS** | `lib/scheduler.ts` checks authorization status before calling the signer and records `skipped (reason)`; genuine signer rejections are caught, classified (`classifyContributionError`), and recorded — the batch loop continues to the next member either way. |
+| 9 | No credential in any tracked file | **PASS** | `.gitignore` excludes `.env`/`.env.*` from the first commit; grepped all 3 commits and every tracked file — only placeholder strings in test fixtures (`"sec-1"`, `"sk-key-1"`), no real key. |
 
-| Control | Enforcement | Purpose |
-| --- | --- | --- |
-| Policy is the enforce point | Privy rejects any `eth_sendTransaction` outside the allowlist/cap; `DENY *` catch-all covers every other method, destination, value | even application drift cannot move other funds |
-| Placeholder refusal | `assertContributionPolicyInput` refuses the zero address | a half-configured policy is never pushed to the Wallet API |
-| Key handling | `PRIVY_AUTHORIZATION_PRIVATE_KEY` read server-side from env only, injected once | the signing key never reaches the browser |
-| Cap + expiry bound the worst case | 0.01 ETH/week, 90-day grant → ≤ 0.01 ETH × ~13 weeks ≈ 0.13 ETH to one contract | bounded exposure per member |
-| Fail-safe scheduler | idempotency at the storage layer (`UNIQUE(member_id, period)`), claim **before** send | a crash or double-cron can never double-send |
-| Per-member isolation | per-member try/catch; revoked/expired → durable `skipped (reason)`; policy rejection → durable `failed (rejected_by_policy)` | one member never aborts the round |
-| Authenticated API only | `join`, `me`, `revoke` all require server-side `verifyAuthToken`; state keyed on `claims.userId` | only the member manages their own authorization |
+Checks 2 and 3 would likely still score on an automated pattern-match (the policy object is
+genuinely committed, well-formed code), but functionally they don't do what the check exists to
+verify: a policy that constrains this specific grant. Check 4 fails outright against its own
+stated fail condition.
 
-## Data Flow
+## Verification findings
 
-1. **Join.** After Privy login the embedded wallet exists. The member taps
-   *Authorize once & join* → `delegateWallet` (the single prompt) → the client
-   calls `POST /api/join` which `ensureMember`s and records an `active`
-   `authorizations` row with `expires_at = granted + TTL`.
-2. **Weekly round (unattended).** The crontab (or `npm run run-scheduler`)
-   runs `runContributionRound`: it calls `markExpired(now)` first, lists all
-   memberships, and for each active member `claimContribution(member, period)`.
-   If the claim wins, `PrivyWalletApiSigner.submitContribution` sends the
-   delegated `eth_sendTransaction`; success → `contributed` + tx hash, policy
-   refusal → `failed (rejected_by_policy)`, any other error → `failed (message)`.
-   Revoked/expired → `skipped (reason)`. One member's result never aborts the
-   batch.
-3. **Review.** `GET /api/me` returns member, authorization (status + expiry),
-   the full per-member outcome ledger, and the committed policy for display.
-4. **Revoke.** The member taps *Revoke authorization* → SDK `revokeWallets()`
-   plus `POST /api/revoke` flips the row to `revoked`; the next round records
-   `skipped (authorization_revoked)` and never sends again.
+We didn't just read the code — we ran it, against a real clean-clone attempt:
 
-## Setup
+- **`npm test` fails 1/44 on a genuine `git clone`.** The repo's `.gitignore` uses the blanket
+  `.env.*` pattern, which also excludes `.env.example` from being tracked, so
+  `tests/secret-scan.test.ts` (which asserts `.env.example` exists on disk) fails on a fresh
+  clone. The upstream README's "44/44 tests green" claim is not reproducible as shipped. We
+  authored `.env.example` ourselves, from the README's own variable table, to get to 44/44 — see
+  [Reproduction](#reproduction) below.
+- **The policy-attachment gap (checks 2–4)** — see the lifecycle diagram and table above. This is
+  the load-bearing finding: the architecture is built on Privy's `delegated-actions` API, which
+  has no per-call attachment point for a policy anywhere used in this code. The problem's own
+  knowledge-graph notes (`road-to-devcon-week3.md`, PS 3 section) point at Privy **session
+  signers with an attached override policy** as the intended primitive — a model where the
+  policy rides on the signer and Privy enforces it regardless of what the app's code does. This
+  repo's `delegated-actions` grant carries no such attachment, so the challenge's central lesson
+  ("limits that hold even if your own code is wrong") isn't actually demonstrated.
 
-```bash
+## What's genuinely solid
+
+- **Idempotency (check 6)** — real SQLite `UNIQUE(member_id, period)` plus claim-before-send in
+  `lib/scheduler.ts`; a crash between claim and submit resolves to a durable
+  `skipped (existing_outcome_claimed)`, never a double-send.
+- **Per-member failure isolation (check 8)** — every member wrapped in its own `try/catch`; one
+  rejection never aborts the batch.
+- **Secrets hygiene (check 9)** — `.gitignore` committed before any code reads a secret, no real
+  key anywhere across history, authorization key only ever constructed server-side.
+- **Revoke control (check 7)** — a real product-UI button, not a script.
+
+## Reproduction
+
+```shell
+git clone https://github.com/Niru-9/road-to-DEVCON-P9.git
+cd road-to-DEVCON-P9
 npm install
-Copy-Item .env.example .env    # then fill in your values (see below)
-npm run dev                    # http://localhost:3000
+npm test            # fails 1/44 — missing .env.example (see Verification findings)
 ```
 
-Requirements: Node.js ≥ 20.12, npm, and a free app at
-<https://dashboard.privy.io> with email + Google login, embedded wallets, **and
-Wallet API with an Authorization Key Pair** enabled.
+`.env.example`, reconstructed from the upstream README's variable table (not shipped upstream):
 
-Cross-check the server side before the UI:
-
-```bash
-npm run check:auth                        # env + committed policy summary
-npm run check:auth -- <access-token>      # real token signature check via Privy
-npm run check:auth -- <access-token> --create-policy  # also push the policy to the Wallet API
+```
+PRIVY_APP_ID=
+PRIVY_APP_SECRET=
+NEXT_PUBLIC_PRIVY_APP_ID=
+PRIVY_AUTHORIZATION_PRIVATE_KEY=
+CONTRIBUTION_CONTRACT_ADDRESS=
+WEEKLY_CONTRIBUTION_CAP_WEI=10000000000000000
+AUTHORIZATION_TTL_SECONDS=7776000
+CAIP2_CHAIN=eip155:84532
+NEXT_PUBLIC_CIRCLE_NAME=
+DB_PATH=data/circle.db
 ```
 
-> Note: P9's local `.env.example` is intentionally not tracked — its own
-> `.gitignore` applies the stricter `.env.*` rule. The variable table below is
-> the working template.
+With that file added:
 
-## Environment Variables
-
-| Variable | Purpose | Required |
-| --- | --- | --- |
-| `PRIVY_APP_ID` | Server-side Privy app id | yes |
-| `PRIVY_APP_SECRET` | Server-side secret (never in client code) | yes |
-| `NEXT_PUBLIC_PRIVY_APP_ID` | Client-side app id for the login provider | yes |
-| `PRIVY_AUTHORIZATION_PRIVATE_KEY` | **(P9-5)** backend Wallet API authorization key, loaded from env at runtime | yes |
-| `CONTRIBUTION_CONTRACT_ADDRESS` | **Deployed** `ContributionCircle` address on Base Sepolia (policy builder **refuses** the placeholder) | for a live round |
-| `WEEKLY_CONTRIBUTION_CAP_WEI` | Per-contribution cap, default `10000000000000000` (0.01 ETH) — enforced **in the policy** | no |
-| `AUTHORIZATION_TTL_SECONDS` | Grant lifetime, default `7776000` (90 d) | no |
-| `CAIP2_CHAIN` | `eip155:84532` (Base Sepolia), the challenge network | no |
-| `NEXT_PUBLIC_CIRCLE_NAME` | Display name | no |
-| `DB_PATH` | SQLite path, default `data/circle.db` | no |
-
-## Verification
-
-```bash
-npm test           # 44 tests / 8 files (unit + component + security audits)
-npm run typecheck  # tsc --noEmit (clean)
-npm run build      # production build (page + 3 dynamic API routes)
+```shell
+npm test            # 44/44 pass
+npm run typecheck   # tsc --noEmit, clean
+npm run build       # succeeds — one harmless warning for an unresolved optional peer
+                     # (@farcaster/mini-app-solana) inside @privy-io/react-auth's bundle
 ```
 
-All tests use a fake Wallet API; none initializes the private key. Proof:
-`lib/contributor.ts` accepts a `ContributionSigner`, and the tests inject a
-mock (`tests/scheduler.test.ts` `makeSigner`). If `.env` is empty, the home
-page renders a friendly configuration card instead of the circle, so the build
-and every server route load cleanly.
+Actual captured output:
 
-| Check | Local source/test | Live Privy + Base Sepolia runtime |
-| --- | --- | --- |
-| P9-1…P9-9 code-level evidence | **PASS** — source + 44 tests + typecheck + production build | **NOT PERFORMED** — no Privy/funded-wallet credentials supplied |
-| One-time `delegateWallet` grant + scope | **PASS** — verified against installed react-auth/server-auth d.ts; wire-flow component test | **NOT PERFORMED** — requires a live Privy app with Wallet API |
-| Committed policy create/enforcement | **PASS** — policy unit-tested; refusal of placeholder tested | **NOT PERFORMED** — run `npm run check:auth -- <token> --create-policy` once `.env` is filled |
-| Server token verification + Wallet API signing | **PASS** — `PrivyClient(..., { walletApi: { authorizationPrivateKey } })` | **NOT PERFORMED** — run `npm run check:auth -- <token>` |
-| Weekly contribution broadcast | **PASS** — delegated `sendTransaction` path tested with a fake Wallet API | **NOT PERFORMED** — nothing was ever broadcast from this repository |
+```
+ Test Files  8 passed (8)
+      Tests  44 passed (44)
+   Duration  2.50s
+```
 
-No access token was ever verified against the Privy API and no transaction was
-ever broadcast from this repository; do not confuse the local results with a
-live check.
+`CONTRIBUTION_CONTRACT_ADDRESS` must be a real deployed address — the policy builder
+(`assertContributionPolicyInput`) throws on the zero placeholder, so `--create-policy` cannot run
+without one. No live Privy/Base Sepolia round was ever run by the original author; all 44 tests
+exercise a fake `ContributionSigner`, never the real Wallet API.
 
-### Dependency notes
+## Project layout
 
-- The production build completes successfully with **one non-blocking warning**
-  for the unresolved optional peer `@farcaster/mini-app-solana` inside
-  `@privy-io/react-auth`'s dist bundle (Privy feature-detects a dynamic
-  `import("@farcaster/mini-app-solana")` at module init). It adds no
-  Farcaster/Solana functionality and does not affect the served app.
-- `permissionless@^0.2.x` is a real **peer** of `@privy-io/react-auth@3.40.0`
-  and is imported by its shipped smart-wallets bundle — installed to satisfy
-  that peer.
-
-## Manual QA
-
-> Requires a free Privy app with Wallet API (an Operator step, not needed for
-> the automatic evaluator path above).
-
-| Step | Action | Expected |
-| --- | --- | --- |
-| 1 | Sign in with Google or email | Embedded wallet is created (`users-without-wallets`); dashboard shows the circle, the committed scope, the wallet address |
-| 2 | Tap **Authorize once & join** | **Exactly one** wallet prompt (the delegated-actions grant). On success the status flips to *active* with an expiry countdown; the durable row exists |
-| 3 | Close the tab, re-open, sign in again | Still authorized — **no second prompt** (P9-1); status still *active* |
-| 4 | Run `npm run run-scheduler` | The round records a `contributed` row (with tx hash) for the current week; ledger shows it |
-| 5 | Run `npm run run-scheduler` again | Idempotent — nothing re-sent, `skipped (existing_outcome...)` for that member/period (P9-6) |
-| 6 | Tap **Revoke** | Status flips to *revoked*; `revokeWallets()` called; a subsequent `run-scheduler` records `skipped (authorization_revoked)` and never sends again (P9-7 / P9-4) |
-| 7 | (Optional) sign in with a second account | The same weekly round serves both members independently; cause one member's submission to fail -> the other still settles (P9-8) |
-| 8 | Inspect the ledger | Every attempt has a durable outcome: `contributed` + hash, `skipped` + reason, `failed` + reason |
-
-## Local vs Live
-
-| Surface | Local (this repo) | Live |
-| --- | --- | --- |
-| Grant flow, policy scope, expiry, idempotency, revoke, per-member outcomes | 44 automated tests with a fake Wallet API | **not performed** — needs a Privy app + Wallet API credentials |
-| Real token verifies + policy create + broadcast | not exercised (no `.env`) | **not performed** — operator must fill `.env` and run `check:auth` |
-| Contract deployment | committed `ContributionCircle.sol` reference only | out of scope for this repository — deployment is an operator decision |
-
-## Limitations
-
-- **No live round was ever run.** A real broadcast requires a **deployed**
-  `ContributionCircle` contract address (the policy **refuses** the placeholder)
-  and a live Privy Wallet API entitlement. Until then the scheduled path is
-  demonstrated by a fake-signer test, not by an on-chain transaction.
-- **Grant expiry is enforced at the application layer.** The Privy policy
-  object itself carries no expiry field; `authorizations.expires_at` is the
-  durable, enforced expiry that the scheduler consults each round.
-- **Weekly cadence is fixed by the period key.** `lib/periods.ts` buckets by
-  UTC week starting Monday; the crontab fires Mondays 12:00 UTC to match.
-- **Per-member activity can race a restart.** A crash between claim and submit
-  leaves a `claimed` row that the next run finalizes as a durable `skipped
-  (existing_outcome_claimed)` — the contribution for that week is not re-sent.
-- **SQLite is process-local.** Suits a single-server demo; no HA/duplication.
-- **One circle.** Membership is a single shared circle contract; multiple
-  pools per member or multi-contract routing are out of scope.
-- **No secrets in tracked files.** `.env` and `.env.*` are gitignored (P9's
-  own `.gitignore` is stricter than the other challenges); `.env.example` is
-  placeholder-only, and `scripts/check-server-auth.ts` will exit 1 without the
-  key.
-
-## Challenge Completion
-
-This repository satisfies **all 9 scored criteria (P9-1 … P9-9)** on the Road
-To Devcon - III problem *"Authorize Once, Then Stop Asking"*:
-
-- the one-time **SDK grant call** from the joining flow (P9-1),
-- a **committed policy allowlisting** the contribution contract (P9-2),
-- a policy-enforced **value cap** (P9-3),
-- bounded grant **expiry** enforced durably (P9-4),
-- server **signing with the env-loaded authorization key** (P9-5),
-- **durable idempotency** behind a real weekly **scheduled path** (P9-6),
-- user-reachable **revoke** control (P9-7),
-- **per-member failure outcomes** that never abort the batch (P9-8),
-- **no secrets in tracked files** (P9-9)
-
-— with **44/44 tests green**, clean `tsc --noEmit`, and a successful production
-build. The automatic evaluator path needs **no credentials**; a live round is a
-documented operator step that requires a deployed contract address and never
-claims to have been executed.
+```
+policies/contribution-policy.ts   allowlist + cap rules (never attached to any grant)
+lib/policy.ts                     pushes the policy object to Privy (manual operator script only)
+lib/auth.ts                       PrivyClient with env-loaded authorization key
+lib/contributor.ts                the actual eth_sendTransaction call (no policyId passed)
+lib/scheduler.ts                  claim-then-send weekly round, per-member try/catch
+lib/store.ts                      SQLite, UNIQUE(member_id, period)
+app/api/join/route.ts             durable membership + app-level expiry row (not grant-level)
+app/api/revoke/route.ts           flips authorization status to revoked
+components/CircleDashboard.tsx    join / revoke UI, delegateWallet / revokeWallets calls
+scripts/check-server-auth.ts      operator script: env check + optional manual policy push
+scheduling/*.crontab              weekly cron entry for scripts/run-scheduler.ts
+tests/                            8 files, 44 tests (unit + component + security)
+```
